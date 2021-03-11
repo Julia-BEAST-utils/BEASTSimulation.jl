@@ -9,7 +9,7 @@ export TreeDiffusionModel,
        randomFactorSimulationModel
 
 using PhyloNetworks, LinearAlgebra, LinearAlgebra.BLAS, DataFrames, Distributions
-using BeastUtils.MatrixUtils, BeastUtils.TreeUtils
+using BeastUtils.MatrixUtils, BEASTTreeUtils
 
 abstract type ModelExtension end
 
@@ -89,7 +89,7 @@ function randomLFM(k::Int, p::Int;
 end
 
 function randomFactorSimulationModel(n::Int, k::Int, p::Int)
-    tree = TreeUtils.rtree(n, ultrametric = true)
+    tree = BEASTTreeUtils.rtree(n, ultrametric = true)
     standardize_height!(tree)
     lfm = randomLFM(k, p)
     tsm = TraitSimulationModel(tipLabels(tree), tree, lfm)

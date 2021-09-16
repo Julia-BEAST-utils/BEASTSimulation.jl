@@ -9,67 +9,102 @@ export TreeDiffusionModel,
        randomFactorSimulationModel
 
 using PhyloNetworks, LinearAlgebra, LinearAlgebra.BLAS, DataFrames, Distributions
+using UnPack
 using BeastUtils.MatrixUtils, BEASTTreeUtils
+
+function force_hermitian(X::AbstractMatrix{Float64})
+    return Hermitian(X)
+end
+
+function force_hermitian(X::Diagonal{Float64})
+    return X
+end
+
+function force_hermitian(X::Hermitian{Float64})
+    return X
+end
+
+import Distributions.MvNormal
+function MvNormal(μ::AbstractVector{Float64}, Σ::Hermitian{Float64})
+    return MvNormal(μ, Symmetric(Σ))
+end
+
 
 abstract type ModelExtension end
 
-struct TreeDiffusionModel
+struct TreeDiffusionModel{T <: Union{Diagonal{Float64}, Hermitian{Float64}},
+                          S <: AbstractVector{Float64}}
     tree::HybridNetwork
-    Σ::AbstractArray{Float64, 2}
-    μ::AbstractArray{Float64, 1}
+    Σ::T
+    μ::S
 
-    function TreeDiffusionModel(tree::HybridNetwork,
-                                Σ::AbstractArray{Float64, 2})
-        p, q = size(Σ)
-        if p != q
-            error("Σ must be square.")
+    function TreeDiffusionModel(tree::HybridNetwork, Σ::AbstractMatrix{Float64},
+                μ::AbstractVector{Float64})
+        Σ = force_hermitian(Σ)
+        if size(Σ, 1) != length(μ)
+            throw(DimensionMismatch("variance is of dimension $(size(Σ)), " *
+                    "but mean is of dimension $(length(μ))."))
         end
-        μ = zeros(p)
-        return new(tree, Σ, μ)
-    end
 
-    function TreeDiffusionModel(newick::String,
-                                Σ::AbstractArray{Float64, 2})
-        tree = readTopology(newick)
-        return TreeDiffusionModel(tree, Σ)
+        return new{typeof(Σ), typeof(μ)}(tree, Σ, μ)
     end
-
-    function TreeDiffusionModel(tree::Union{String, HybridNetwork}, p::Int)
-        return TreeDiffusionModel(tree, Diagonal(ones(p)))
-    end
-
 end
 
-struct ResidualVarianceModel <: ModelExtension
-    Γ::AbstractArray{Float64, 2} # residual variance
+function TreeDiffusionModel(tree::HybridNetwork,
+                            Σ::AbstractArray{Float64, 2})
+    p = size(Σ, 1)
+    μ = zeros(p)
+    return TreeDiffusionModel(tree, Σ, μ)
+end
+
+function TreeDiffusionModel(newick::String,
+                            Σ::AbstractArray{Float64, 2})
+    tree = readTopology(newick)
+    return TreeDiffusionModel(tree, Σ)
+end
+
+function TreeDiffusionModel(tree::Union{String, HybridNetwork}, p::Int)
+    return TreeDiffusionModel(tree, Diagonal(ones(p)))
+end
+
+struct ResidualVarianceModel{T <: AbstractMatrix{Float64}} <: ModelExtension
+    Γ::T # residual variance
 
     function ResidualVarianceModel(Γ::AbstractArray{Float64, 2})
         if !issquare(Γ)
             error("Γ must be square.")
         end
-
-        return new(Γ)
+        Γ = force_hermitian(Γ)
+        return new{typeof(Γ)}(Γ)
     end
 
 end
 
-struct LatentFactorModel <: ModelExtension
-    L::AbstractArray{Float64, 2} # loadings matrix
-    Λ::Diagonal{Float64} # residual variance
+struct LatentFactorModel{S <: AbstractMatrix{Float64},
+                         T <: AbstractMatrix{Float64}} <: ModelExtension
+    L::S # loadings matrix
+    Λ::T # residual variance
 
-    function LatentFactorModel(L::AbstractArray{Float64, 2},
-                                Λ::Diagonal{Float64})
+    function LatentFactorModel(L::AbstractMatrix{Float64},
+                                Λ::AbstractMatrix{Float64})
 
         k, p = size(L)
-        if size(Λ, 1) != p
-            q = size(Λ, 1)
+        if !issquare(Λ)
+            error("Residual variance Λ must be square.")
+        end
+        if size(Λ) != (p, p)
+            q, s = size(Λ)
             error("Marices are non-conformable." *
-                    " Matrix L has $p columns while matrix Λ is $q x $q.")
+                    " Matrix L has $p columns while matrix Λ is $q x $s.")
         end
 
-        return new(L, Λ)
-    end
+        Λ = force_hermitian(Λ)
 
+        S = typeof(L)
+        T = typeof(Λ)
+
+        return new{S, T}(L, Λ)
+    end
 end
 
 function treeDimension(x::LatentFactorModel)
@@ -78,6 +113,26 @@ end
 
 function treeDimension(x::ResidualVarianceModel)
     return size(x.Γ, 1)
+end
+
+function dataDimension(x::LatentFactorModel)
+    return size(x.L, 2)
+end
+
+function dataDimension(x::ResidualVarianceModel)
+    return treeDimension(x)
+end
+
+function get_loadings(x::LatentFactorModel)
+    return x.L
+end
+
+function get_loadings(x::ResidualVarianceModel)
+    return I
+end
+
+function get_residual_variance(x::LatentFactorModel)
+    return x.Λ
 end
 
 function randomLFM(k::Int, p::Int;
@@ -95,6 +150,32 @@ function randomFactorSimulationModel(n::Int, k::Int, p::Int)
     tsm = TraitSimulationModel(tipLabels(tree), tree, lfm)
     return tsm
 end
+
+function merge_models(models::ModelExtension...)
+    n = length(models)
+    tree_dims = treeDimension.(models)
+    data_dims = dataDimension.(models)
+    K = sum(tree_dims)
+    P = sum(data_dims)
+    L = zeros(K, P)
+    Λ = zeros(P, P)
+    k_offset = 0
+    p_offset = 0
+    for i = 1:n
+        k_end = k_offset + tree_dims[i]
+        p_end = p_offset + data_dims[i]
+        k_rng = (k_offset + 1):k_end
+        p_rng = (p_offset + 1):p_end
+        L[k_rng, p_rng] .= get_loadings(models[i])
+        Λ[p_rng, p_rng] .= get_residual_variance(models[i])
+        k_offset = k_end
+        p_offset = p_end
+    end
+
+    return LatentFactorModel(L, Λ)
+end
+
+
 
 
 mutable struct TraitSimulationModel
@@ -176,10 +257,11 @@ function add_extension(data::Matrix{Float64}, lfm::LatentFactorModel)
     n, k = size(data)
     p = size(lfm.L, 2)
     Y = data * lfm.L
-    chol_vec = sqrt.(lfm.Λ.diag) # Λ is diagonal
+
+    res_dist = MvNormal(zeros(p), lfm.Λ)
 
     for i = 1:n
-        Y[i, :] .+= chol_vec .* randn(p)
+        Y[i, :] .+= rand(res_dist)
     end
 
     return Y
@@ -198,7 +280,7 @@ function simulate(tsm::TraitSimulationModel)
 
 end
 
-
+include("distributions.jl")
 
 
 end

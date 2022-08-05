@@ -41,7 +41,7 @@ end
 
 
 function data_distribution(tsm::TraitSimulationModel; pss::Float64 = Inf)
-    comps = varianceComponents(tsm)
+    comps = varianceComponents(tsm, pss = pss)
     Σ = data_variance(comps)
     n = length(tsm.taxa)
     μ = vec(ones(n) * (tsm.treeModel.μ' * comps.L))

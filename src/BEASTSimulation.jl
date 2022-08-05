@@ -1,12 +1,16 @@
 module BEASTSimulation
 
 export TreeDiffusionModel,
+       NoExtensionModel,
+       MergedExtension,
+       StackedExtension,
        ResidualVarianceModel,
        LatentFactorModel,
        TraitSimulationModel,
        simulate,
        get_newick,
-       randomFactorSimulationModel
+       randomFactorSimulationModel,
+       split_indices
 
 using PhyloNetworks, LinearAlgebra, LinearAlgebra.BLAS, DataFrames, Distributions
 using UnPack
@@ -67,6 +71,38 @@ function TreeDiffusionModel(tree::Union{String, HybridNetwork}, p::Int)
     return TreeDiffusionModel(tree, Diagonal(ones(p)))
 end
 
+struct MergedExtension <: ModelExtension
+    models::Vector{<:ModelExtension}
+end
+
+struct NoExtensionModel <: ModelExtension
+    k::Int
+
+    function NoExtensionModel(k::Int)
+        if k < 1
+            error("dimensionality must be at least 1")
+        end
+
+        return new(k)
+    end
+end
+
+struct StackedExtension <: ModelExtension
+    models::Vector{<:ModelExtension}
+
+    function StackedExtension(models::Vector{<:ModelExtension})
+        n = length(models)
+        for i = 1:(n - 1)
+            @assert !(typeof(models[i]) <: LatentFactorModel)
+            @assert dataDimension(models[i]) == treeDimension(models[i + 1])
+        end
+        return new(models)
+    end
+
+end
+
+
+
 struct ResidualVarianceModel{T <: AbstractMatrix{Float64}} <: ModelExtension
     Γ::T # residual variance
 
@@ -107,12 +143,34 @@ struct LatentFactorModel{S <: AbstractMatrix{Float64},
     end
 end
 
+function LatentFactorModel(L::AbstractMatrix{Float64})
+    p = size(L, 2)
+    Λ = Diagonal(ones(p))
+    return LatentFactorModel(L, Λ)
+end
+
+function treeDimension(x::NoExtensionModel)
+    return x.k
+end
+
 function treeDimension(x::LatentFactorModel)
     return size(x.L, 1)
 end
 
 function treeDimension(x::ResidualVarianceModel)
     return size(x.Γ, 1)
+end
+
+function treeDimension(x::StackedExtension)
+    return treeDimension(x.models[1])
+end
+
+function dataDimension(x::StackedExtension)
+    return dataDimension(x.models[end])
+end
+
+function dataDimension(x::NoExtensionModel)
+    return x.k
 end
 
 function dataDimension(x::LatentFactorModel)
@@ -128,12 +186,74 @@ function get_loadings(x::LatentFactorModel)
 end
 
 function get_loadings(x::ResidualVarianceModel)
-    return I
+    return Diagonal(ones(treeDimension(x)))
 end
+
+function get_loadings(x::NoExtensionModel)
+    return Diagonal(ones(treeDimension(x)))
+end
+
+function get_loadings(x::MergedExtension)
+    tree_dims = [treeDimension(m) for m in x.models]
+    data_dims = [dataDimension(m) for m in x.models]
+    k = sum(tree_dims)
+    p = sum(data_dims)
+    L = zeros(k, p)
+    k_offset = 0
+    p_offset = 0
+
+    for i = 1:length(x.models)
+         L[(k_offset + 1):(k_offset + tree_dims[i]),
+          (p_offset + 1):(p_offset + data_dims[i])] .= get_loadings(x.models[i])
+        k_offset += tree_dims[i]
+        p_offset += data_dims[i]
+    end
+    return L
+end
+
+function get_loadings(x::StackedExtension)
+    return get_loadings(x.models[end])
+end
+
+function get_residual_variance(x::StackedExtension)
+    n = length(x.models)
+    V = get_residual_variance(x.models[1])
+
+    for i = 2:n
+        L = get_loadings(x.models[i])
+        V = L' * V * L + get_residual_variance(x.models[i])
+    end
+
+    return V
+end
+
 
 function get_residual_variance(x::LatentFactorModel)
     return x.Λ
 end
+
+function get_residual_variance(x::ResidualVarianceModel)
+    return x.Γ
+end
+
+function get_residual_variance(x::NoExtensionModel)
+    return zeros(x.k, x.k)
+end
+
+function get_residual_variance(x::MergedExtension)
+    data_dims = [dataDimension(m) for m in x.models]
+    p = sum(data_dims)
+    V = zeros(p, p)
+    offset = 0
+
+    for i = 1:length(x.models)
+        inds = (offset + 1):(offset + data_dims[i])
+        V[inds, inds] .= get_residual_variance(x.models[i])
+        offset += data_dims[i]
+    end
+    return V
+end
+
 
 function randomLFM(k::Int, p::Int;
                     L_dist::UnivariateDistribution = Normal(0, 1),
@@ -151,30 +271,60 @@ function randomFactorSimulationModel(n::Int, k::Int, p::Int)
     return tsm
 end
 
-function merge_models(models::ModelExtension...)
-    n = length(models)
-    tree_dims = treeDimension.(models)
-    data_dims = dataDimension.(models)
-    K = sum(tree_dims)
-    P = sum(data_dims)
-    L = zeros(K, P)
-    Λ = zeros(P, P)
-    k_offset = 0
-    p_offset = 0
-    for i = 1:n
-        k_end = k_offset + tree_dims[i]
-        p_end = p_offset + data_dims[i]
-        k_rng = (k_offset + 1):k_end
-        p_rng = (p_offset + 1):p_end
-        L[k_rng, p_rng] .= get_loadings(models[i])
-        Λ[p_rng, p_rng] .= get_residual_variance(models[i])
-        k_offset = k_end
-        p_offset = p_end
-    end
+# function merge_models(models::ModelExtension...)
+#     n = length(models)
+#     tree_dims = treeDimension.(models)
+#     data_dims = dataDimension.(models)
+#     K = sum(tree_dims)
+#     P = sum(data_dims)
+#     L = zeros(K, P)
+#     Λ = zeros(P, P)
+#     k_offset = 0
+#     p_offset = 0
+#     for i = 1:n
+#         k_end = k_offset + tree_dims[i]
+#         p_end = p_offset + data_dims[i]
+#         k_rng = (k_offset + 1):k_end
+#         p_rng = (p_offset + 1):p_end
+#         L[k_rng, p_rng] .= get_loadings(models[i])
+#         Λ[p_rng, p_rng] .= get_residual_variance(models[i])
+#         k_offset = k_end
+#         p_offset = p_end
+#     end
 
-    return LatentFactorModel(L, Λ)
+#     return LatentFactorModel(L, Λ)
+# end
+
+function merge_models(models::ModelExtension...)
+    return MergedExtension(collect(models))
 end
 
+function split_indices(mext::MergedExtension)
+    data_dims = [dataDimension(m) for m in mext.models]
+    n = length(mext.models)
+
+    inds = Vector{UnitRange{Int}}(undef, n)
+    offset = 0
+    for i = 1:n
+        new_offset = offset + data_dims[i]
+        inds[i] = (offset + 1):new_offset
+        offset = new_offset
+    end
+    return inds
+end
+
+function split_indices(dims::Vector{Int})
+    n = length(dims)
+
+    inds = Vector{UnitRange{Int}}(undef, n)
+    offset = 0
+    for i = 1:n
+        new_offset = offset + dims[i]
+        inds[i] = (offset + 1):new_offset
+        offset = new_offset
+    end
+    return inds
+end
 
 
 
@@ -239,7 +389,11 @@ function simulate_on_tree(model::TreeDiffusionModel,
     return Y
 end
 
-function add_extension(data::Matrix{Float64}, rvm::ResidualVarianceModel)
+function add_extension(data::AbstractMatrix{Float64}, nem::NoExtensionModel)
+    return data
+end
+
+function add_extension(data::AbstractMatrix{Float64}, rvm::ResidualVarianceModel)
 
     L_chol = cholesky(rvm.Γ).L
 
@@ -253,7 +407,7 @@ function add_extension(data::Matrix{Float64}, rvm::ResidualVarianceModel)
     return data
 end
 
-function add_extension(data::Matrix{Float64}, lfm::LatentFactorModel)
+function add_extension(data::AbstractMatrix{Float64}, lfm::LatentFactorModel)
     n, k = size(data)
     p = size(lfm.L, 2)
     Y = data * lfm.L
@@ -266,6 +420,29 @@ function add_extension(data::Matrix{Float64}, lfm::LatentFactorModel)
 
     return Y
 end
+
+function add_extension(data::Matrix{Float64}, me::MergedExtension)
+    n, k = size(data)
+    models = me.models
+    ks = [treeDimension(m) for m in models]
+    ps = [dataDimension(m) for m in models]
+    p = sum(ps)
+    Y = zeros(n, p)
+
+    data_offset = 0
+    tree_offset = 0
+    for i = 1:length(models)
+
+        data_sub = @view data[:, (tree_offset + 1):(tree_offset + ks[i])]
+        Y_sub = add_extension(data_sub, models[i])
+        Y[:, (data_offset + 1):(data_offset + ps[i])] .= Y_sub
+
+        data_offset += ps[i]
+        tree_offset += ks[i]
+    end
+    return Y
+end
+
 
 import PhyloNetworks: simulate
 function simulate(tsm::TraitSimulationModel)
